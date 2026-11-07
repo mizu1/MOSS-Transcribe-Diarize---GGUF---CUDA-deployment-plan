@@ -222,4 +222,3 @@ MLX 格式的模型（如 `mlx-*`）只能跑在 Apple Silicon，Windows/NVIDIA 
 - 上游代码：https://github.com/OpenMOSS/MOSS-Transcribe-Diarize
 - C++ 推理实现：https://github.com/mudler/moss-transcribe.cpp
 - GGUF 权重：https://www.modelscope.cn/models/mudler/moss-transcribe.cpp-gguf
-- 本仓库对上游的反馈记录：`mtd/docs/upstream-feedback.md`（分支 `docs/upstream-feedback`）
