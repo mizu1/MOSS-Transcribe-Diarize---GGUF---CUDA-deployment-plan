@@ -1,0 +1,14 @@
+# 模型权重（约 510 MB，用 modelscope 下载，不进仓库）
+models/
+
+# 上游源码 clone + 构建产物（独立仓库，自行 clone）
+mtd/
+
+# 测试音频（可用 gen4.py 重新生成，或自行放入）
+audio/
+
+# 运行日志与缓存
+logs/
+*.log
+__pycache__/
+*.pyc
