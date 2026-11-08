@@ -160,7 +160,8 @@ python server.py --port 8099
 | 过零率 | 低（浊音）~中 | 高（宽频） |
 | 谱平坦度 | 低（有共振峰结构） | 接近 1（接近白噪声） |
 
-过滤掉短于 3 帧的孤立瞬态后，若人声累计不足 `--vad-min-speech` 秒，直接返回空结果并标记 `skipped: true`。
+过滤掉短于 3 帧的孤立瞬态后，若人声累计不足 `--vad-min-speech` 秒，**直接返回 `204 No Content`，响应体为空**，
+调用方按 HTTP 状态码判断即可，不需要解析任何内容。
 实测 5 分钟音频分析耗时约 217 ms（比 Silero VAD 快 14 倍）。
 
 **2. 裁剪：去掉首尾的非语音段**，保留 0.25 秒缓冲，返回的时间戳自动补偿偏移。
@@ -216,9 +217,12 @@ curl -X POST http://127.0.0.1:8099/v1/audio/transcriptions \
   "speakers": ["S01", "S02"],
   "duration": 12.0,
   "elapsed": 1.592,
-  "rtf": 0.133
+  "rtf": 0.133,
+  "vad": {"enabled": true, "speech_seconds": 11.4, "ratio": 0.95, "noise_floor_db": -62.3}
 }
 ```
+
+被门禁判定为无人声时，返回 **`204 No Content`**，响应体为空（0 字节），调用方按状态码处理即可。
 
 ---
 

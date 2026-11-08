@@ -171,6 +171,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_no_content(self):
+        """被门禁滤掉：不返回任何内容体"""
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith("/health"):
             log(f"→ GET /health  来自 {self.client_address[0]}")
@@ -213,13 +219,10 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 if st["speech_seconds"] < VAD_MIN_SPEECH:
                     cost = time.time() - t0
-                    log(f"← 跳过：{full_dur:.2f}s 音频但人声仅 {st['speech_seconds']:.2f}s "
-                        f"({st['ratio'] * 100:.1f}%) | 未调用模型 | 耗时 {cost * 1000:.0f}ms")
-                    self._send(200, {
-                        "text": "", "segments": [], "speakers": [],
-                        "duration": round(full_dur, 2), "elapsed": round(cost, 3),
-                        "rtf": 0.0, "skipped": True, "reason": "no_speech", "vad": vinfo,
-                    })
+                    log(f"← 丢弃：{full_dur:.2f}s 音频但人声仅 {st['speech_seconds']:.2f}s "
+                        f"({st['ratio'] * 100:.1f}%) | 未调用模型 | 耗时 {cost * 1000:.0f}ms "
+                        f"| 返回 204 无内容")
+                    self._send_no_content()
                     return
 
                 if VAD_TRIM and st["segments"]:
@@ -273,7 +276,6 @@ class Handler(BaseHTTPRequestHandler):
                 "duration": round(full_dur, 2),
                 "elapsed": round(cost, 3),
                 "rtf": round(cost / full_dur, 4) if full_dur else None,
-                "skipped": False,
                 "vad": vinfo,
             })
         except Exception as e:
