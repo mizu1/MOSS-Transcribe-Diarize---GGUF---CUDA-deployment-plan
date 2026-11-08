@@ -19,12 +19,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+import vad as vad_mod
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DLL = os.path.join(ROOT, "mtd", "build-cuda-shared", "moss-transcribe.dll")
 GGUF = os.path.join(ROOT, "models", "gguf", "moss-transcribe-q4_0.gguf")
 SR = 16000
 LOG_TEXT = True          # 是否打印转写正文（--no-text 关闭）
 LOG_LOCK = threading.Lock()
+
+# ---- 进模型前的门禁 ----
+VAD_ON = True            # --no-vad 关闭
+VAD_MIN_SPEECH = 0.3     # 人声累计低于该秒数判定为"无人声"，直接跳过模型
+VAD_TRIM = True          # --no-trim 关闭：裁掉首尾静音/噪声
+VAD_PAD = 0.25           # 裁剪时两侧保留的缓冲
+LOOP_GUARD = True        # --no-loop-guard 关闭：输出复读折叠
 
 
 def log(msg):
@@ -82,6 +91,23 @@ def parse_segments(text):
                 "text": body,
             })
     return segs
+
+
+REPEAT_RE = re.compile(r"(.{1,40}?)\1{4,}", re.S)
+
+
+def collapse_loops(text, max_cycle=4):
+    """折叠模型在噪声/静音上产生的复读，例如 "Yeah. Yeah. Yeah. …" """
+    if not LOOP_GUARD:
+        return text, False
+    hit = False
+    for _ in range(6):
+        m = REPEAT_RE.search(text)
+        if not m:
+            break
+        text = text[: m.start()] + m.group(1) * min(max_cycle, 2) + "…"
+        hit = True
+    return text, hit
 
 
 def decode_audio(raw):
@@ -153,6 +179,8 @@ class Handler(BaseHTTPRequestHandler):
                 "model": os.path.basename(GGUF),
                 "backend": "CUDA",
                 "load_seconds": round(LOAD_SECONDS, 2),
+                "vad": {"enabled": VAD_ON, "min_speech": VAD_MIN_SPEECH, "trim": VAD_TRIM},
+                "loop_guard": LOOP_GUARD,
             })
         else:
             log(f"→ GET {self.path}  404")
@@ -172,13 +200,64 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = extract_file(body, ctype)
             pcm = decode_audio(raw)
-            text = transcribe(pcm)
-            segs = parse_segments(text)
-            cost = time.time() - t0
+            full_dur = len(pcm) / SR
+
+            # ---- 门禁：没有人声就不进模型，避免复读循环 ----
+            vinfo = {"enabled": VAD_ON, "speech_seconds": None, "ratio": None}
+            if VAD_ON:
+                st = vad_mod.analyze(pcm)
+                vinfo.update({
+                    "speech_seconds": st["speech_seconds"],
+                    "ratio": st["ratio"],
+                    "noise_floor_db": st["noise_floor_db"],
+                })
+                if st["speech_seconds"] < VAD_MIN_SPEECH:
+                    cost = time.time() - t0
+                    log(f"← 跳过：{full_dur:.2f}s 音频但人声仅 {st['speech_seconds']:.2f}s "
+                        f"({st['ratio'] * 100:.1f}%) | 未调用模型 | 耗时 {cost * 1000:.0f}ms")
+                    self._send(200, {
+                        "text": "", "segments": [], "speakers": [],
+                        "duration": round(full_dur, 2), "elapsed": round(cost, 3),
+                        "rtf": 0.0, "skipped": True, "reason": "no_speech", "vad": vinfo,
+                    })
+                    return
+
+                if VAD_TRIM and st["segments"]:
+                    s0 = max(0.0, st["segments"][0][0] - VAD_PAD)
+                    s1 = min(full_dur, st["segments"][-1][1] + VAD_PAD)
+                    if s0 > 0.05 or s1 < full_dur - 0.05:
+                        pcm = pcm[int(s0 * SR): int(s1 * SR)]
+                        vinfo["trimmed"] = [round(s0, 2), round(s1, 2)]
+                        vinfo["removed"] = round(full_dur - (s1 - s0), 2)
+                if "trimmed" in vinfo:
+                    offset = vinfo["trimmed"][0]
+                else:
+                    offset = 0.0
+            else:
+                offset = 0.0
+
             dur = len(pcm) / SR
+            # ---- 生成上限兜底：按剩余时长给足余量，避免失控 -->
+            max_new = int(min(8192, max(128, dur * 16 + 128)))
+            text = transcribe(pcm, max_new=max_new)
+            text, collapsed = collapse_loops(text)
+            vinfo["loop_collapsed"] = collapsed
+
+            segs = parse_segments(text)
+            if offset:
+                for s in segs:
+                    s["start"] = round(s["start"] + offset, 2)
+                    s["end"] = round(s["end"] + offset, 2)
+
+            cost = time.time() - t0
             spk = sorted({s["speaker"] for s in segs})
-            log(f"← {dur:.2f}s 音频 | 耗时 {cost:.2f}s | RTF {cost / dur:.3f} "
-                f"({dur / cost:.1f}x 实时) | {len(segs)} 段 | 说话人 {','.join(spk) or '-'}")
+            speech_tag = (f"人声 {vinfo['speech_seconds']:.2f}s | "
+                          if vinfo["speech_seconds"] is not None else "")
+            log(f"← {full_dur:.2f}s 音频 | {speech_tag}"
+                f"耗时 {cost:.2f}s | RTF {cost / full_dur:.3f} ({full_dur / cost:.1f}x 实时) "
+                f"| {len(segs)} 段 | 说话人 {','.join(spk) or '-'}"
+                + (f" | 已裁首尾 {vinfo.get('removed', 0)}s" if "trimmed" in vinfo else "")
+                + (" | 复读已折叠" if collapsed else ""))
             if LOG_TEXT:
                 for s in segs:
                     t = s["text"]
@@ -191,9 +270,11 @@ class Handler(BaseHTTPRequestHandler):
                 "text": "".join(s["text"] for s in segs) or text,
                 "segments": segs,
                 "speakers": spk,
-                "duration": round(dur, 2),
+                "duration": round(full_dur, 2),
                 "elapsed": round(cost, 3),
-                "rtf": round(cost / dur, 4) if dur else None,
+                "rtf": round(cost / full_dur, 4) if full_dur else None,
+                "skipped": False,
+                "vad": vinfo,
             })
         except Exception as e:
             log(f"← 错误 {type(e).__name__}: {e}")
@@ -205,13 +286,25 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-text", action="store_true", help="只打印请求与耗时，不打印转写正文")
+    ap.add_argument("--no-vad", action="store_true", help="关闭人声门禁（噪声也会进模型）")
+    ap.add_argument("--vad-min-speech", type=float, default=0.3,
+                    help="人声累计低于该秒数则跳过模型，默认 0.3")
+    ap.add_argument("--no-trim", action="store_true", help="只做门禁，不裁首尾静音")
+    ap.add_argument("--no-loop-guard", action="store_true", help="关闭输出复读折叠")
     a = ap.parse_args()
+
     LOG_TEXT = not a.no_text
+    VAD_ON = not a.no_vad
+    VAD_MIN_SPEECH = a.vad_min_speech
+    VAD_TRIM = not a.no_trim
+    LOOP_GUARD = not a.no_loop_guard
 
     log(f"加载模型 {os.path.basename(GGUF)}")
     load_model()
-    log(f"就绪 | 加载 {LOAD_SECONDS:.2f}s | 显存已占用 | http://{a.host}:{a.port}")
+    log(f"就绪 | 加载 {LOAD_SECONDS:.2f}s | http://{a.host}:{a.port}")
     log(f"接口: GET /health | POST /v1/audio/transcriptions | 正文日志 {'开' if LOG_TEXT else '关'}")
+    log(f"人声门禁 {('开(阈值 %.2fs)' % VAD_MIN_SPEECH) if VAD_ON else '关'} | "
+        f"首尾裁剪 {'开' if VAD_TRIM else '关'} | 复读折叠 {'开' if LOOP_GUARD else '关'}")
     log("等待请求 ...")
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
