@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import wave
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -22,6 +23,14 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DLL = os.path.join(ROOT, "mtd", "build-cuda-shared", "moss-transcribe.dll")
 GGUF = os.path.join(ROOT, "models", "gguf", "moss-transcribe-q4_0.gguf")
 SR = 16000
+LOG_TEXT = True          # 是否打印转写正文（--no-text 关闭）
+LOG_LOCK = threading.Lock()
+
+
+def log(msg):
+    with LOG_LOCK:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
 
 os.environ.setdefault("MTD_DEVICE", "cuda")
 
@@ -138,6 +147,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/health"):
+            log(f"→ GET /health  来自 {self.client_address[0]}")
             self._send(200, {
                 "status": "ok",
                 "model": os.path.basename(GGUF),
@@ -145,30 +155,48 @@ class Handler(BaseHTTPRequestHandler):
                 "load_seconds": round(LOAD_SECONDS, 2),
             })
         else:
+            log(f"→ GET {self.path}  404")
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         if not self.path.startswith("/v1/audio/transcriptions"):
+            log(f"→ POST {self.path}  404")
             self._send(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length", 0))
+        ctype = self.headers.get("Content-Type", "")
+        log(f"→ POST {self.path}  来自 {self.client_address[0]}:{self.client_address[1]} "
+            f"| {length / 1024:.1f} KB | {ctype or 'unknown'}")
         body = self.rfile.read(length)
         t0 = time.time()
         try:
-            raw = extract_file(body, self.headers.get("Content-Type", ""))
+            raw = extract_file(body, ctype)
             pcm = decode_audio(raw)
             text = transcribe(pcm)
             segs = parse_segments(text)
             cost = time.time() - t0
+            dur = len(pcm) / SR
+            spk = sorted({s["speaker"] for s in segs})
+            log(f"← {dur:.2f}s 音频 | 耗时 {cost:.2f}s | RTF {cost / dur:.3f} "
+                f"({dur / cost:.1f}x 实时) | {len(segs)} 段 | 说话人 {','.join(spk) or '-'}")
+            if LOG_TEXT:
+                for s in segs:
+                    t = s["text"]
+                    if len(t) > 120:
+                        t = t[:120] + "…"
+                    log(f"     [{s['start']:6.2f}-{s['end']:6.2f}] {s['speaker']} {t}")
+                if not segs:
+                    log(f"     原始输出: {text[:200] or '(空)'}")
             self._send(200, {
                 "text": "".join(s["text"] for s in segs) or text,
                 "segments": segs,
-                "speakers": sorted({s["speaker"] for s in segs}),
-                "duration": round(len(pcm) / SR, 2),
+                "speakers": spk,
+                "duration": round(dur, 2),
                 "elapsed": round(cost, 3),
-                "rtf": round(cost / (len(pcm) / SR), 4) if len(pcm) else None,
+                "rtf": round(cost / dur, 4) if dur else None,
             })
         except Exception as e:
+            log(f"← 错误 {type(e).__name__}: {e}")
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
 
@@ -176,11 +204,19 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--no-text", action="store_true", help="只打印请求与耗时，不打印转写正文")
     a = ap.parse_args()
+    LOG_TEXT = not a.no_text
 
-    print(f"加载模型 {os.path.basename(GGUF)} ...", flush=True)
+    log(f"加载模型 {os.path.basename(GGUF)}")
     load_model()
-    print(f"就绪，耗时 {LOAD_SECONDS:.2f}s | http://{a.host}:{a.port}", flush=True)
+    log(f"就绪 | 加载 {LOAD_SECONDS:.2f}s | 显存已占用 | http://{a.host}:{a.port}")
+    log(f"接口: GET /health | POST /v1/audio/transcriptions | 正文日志 {'开' if LOG_TEXT else '关'}")
+    log("等待请求 ...")
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log("收到中断，关闭服务")
+        srv.shutdown()
